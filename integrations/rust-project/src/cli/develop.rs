@@ -312,6 +312,15 @@ impl Develop {
             ..
         } = self;
 
+        // `always_check` is the user-configured allow-list of patterns that
+        // `rust-project check` will build on every save. The same patterns
+        // must also be in the rust-project.json crate graph; otherwise
+        // rust-analyzer drops diagnostics whose `package_id` it doesn't
+        // recognize. Append them to the saved-file-derived targets so
+        // `expand_and_resolve` walks both halves of the dep tree together.
+        let mut targets = targets;
+        targets.extend(always_check.iter().cloned().map(Target::new));
+
         info!(kind = "progress", "finding std source code");
         let sysroot = match &sysroot {
             SysrootConfig::Sysroot {
