@@ -8,13 +8,17 @@
  * above-listed licenses.
  */
 
+use std::io::Write;
 use std::path::Path;
-use std::str::FromStr;
+use std::path::PathBuf;
 
 use anyhow::Context as _;
+use serde_json::json;
 
 use crate::buck;
 use crate::buck::Buck;
+use crate::buck::BxlRecord;
+use crate::buck::CheckStream;
 use crate::cli::TargetOrFile;
 use crate::diagnostics;
 
@@ -22,16 +26,25 @@ pub(crate) struct Check {
     pub(crate) buck: buck::Buck,
     pub(crate) use_clippy: bool,
     pub(crate) target_or_saved_file: TargetOrFile,
+    /// Buck target patterns that should be checked on every save in addition
+    /// to the saved file's owning target.
+    pub(crate) always_check: Vec<String>,
 }
 
 impl Check {
-    pub(crate) fn new(buck: Buck, use_clippy: bool, target_or_saved_file: TargetOrFile) -> Self {
+    pub(crate) fn new(
+        buck: Buck,
+        use_clippy: bool,
+        target_or_saved_file: TargetOrFile,
+        always_check: Vec<String>,
+    ) -> Self {
         let target_or_saved_file = target_or_saved_file.canonicalize();
 
         Self {
             buck,
             use_clippy,
             target_or_saved_file,
+            always_check,
         }
     }
 
@@ -40,54 +53,147 @@ impl Check {
         let start = std::time::Instant::now();
         let buck = &self.buck;
 
-        let check_output = match &self.target_or_saved_file {
-            TargetOrFile::Target(target) => buck.check_target(self.use_clippy, target)?,
-            TargetOrFile::File(saved_file) => buck.check_saved_file(self.use_clippy, saved_file)?,
+        let stream = match &self.target_or_saved_file {
+            TargetOrFile::Target(target) => {
+                buck.check_target(self.use_clippy, target, &self.always_check)?
+            }
+            TargetOrFile::File(saved_file) => {
+                buck.check_saved_file(self.use_clippy, saved_file, &self.always_check)?
+            }
         };
 
-        let mut diagnostics = vec![];
-        for path in check_output.diagnostic_paths {
-            let contents = std::fs::read_to_string(&path).context(format!(
-                "Trying to read JSON file of diagnostics: {}",
-                path.display(),
-            ))?;
-            for l in contents.lines() {
-                // rustc (and with greater relevance, the underlying build.bxl script) emits diagnostics as newline-delimited JSON.
-                // One complicating factor is that the file paths in the diagnostics are relative to each Buck project, which assumes that
-                // a user does their work from a project root, such as `fbsource`. this means that the diagnostics for `lib.rs` in
-                // `fbcode//common/rust/tracing-scuba:tracing-scuba` will be shown as `fbcode/common/rust/tracing-scuba/src/lib.rs`.
-                //
-                // this is not ideal. if the user decides to open their editor from the cell root (`fbcode`) or the target's
-                // directory (`fbsource/fbcode/common/rust/tracing-scuba`), rust-analyzer will attempt to normalize the file paths
-                // in the machine-readable diagnostic message relative to the current working directory. rust-analyzer will then not
-                // be able find the resulting path inside its VFS, leading to no diagnostics being shown to the user. To fix this,
-                // we rewrite the file paths in the diagnostics to be relative to the buck2 project root, resulting in a fully absolute
-                // path.
-                if let Ok(mut message) = serde_json::from_str::<diagnostics::Message>(l) {
-                    make_message_absolute(&mut message, &check_output.project_root);
-
-                    let span = serde_json::to_value(message)?;
-                    // this is done under the assumption that the number of diagnostics inside the vector
-                    // is small (e.g., 32 or 64), so a linear seach of a vector will faster than hashing each element.
-                    if !diagnostics.contains(&span) {
-                        diagnostics.push(span);
-                    }
-                } else {
-                    let value = serde_json::Value::from_str(l)?;
-                    diagnostics.push(value)
-                }
-            }
-        }
-
-        for diagnostic in diagnostics {
-            let out = serde_json::to_string(&diagnostic)?;
-            println!("{out}");
-        }
+        // Lock stdout for the duration of the stream so partial diagnostic
+        // lines from concurrent log output can't interleave with ours.
+        let stdout = std::io::stdout();
+        let mut writer = stdout.lock();
+        stream_diagnostics(stream, &mut writer)?;
 
         crate::scuba::log_check(start.elapsed(), &self.target_or_saved_file, self.use_clippy);
 
         Ok(())
     }
+}
+
+/// Drive the BXL stream to completion, forwarding diagnostics to `writer` as
+/// each target finishes.
+///
+/// For each target: read the diag_json file referenced by the streamed record,
+/// rewrite span paths to be absolute, emit one `compiler-message` envelope per
+/// rustc message, then a `compiler-artifact` sentinel for the target.
+///
+/// The `compiler-artifact` is what triggers per-package stale-diagnostic
+/// clearing in rust-analyzer's flycheck — without it, targets that go from
+/// "had errors" to "no errors" keep their stale entries on screen.
+///
+/// Note: the previous batch path deduplicated identical diagnostics across
+/// targets. We do not — `package_id` attribution in the envelope is how
+/// flycheck distinguishes per-target diagnostics, and dedup would defeat
+/// per-target clearing when the same lib appears in multiple targets.
+fn stream_diagnostics<W: Write>(
+    mut stream: CheckStream,
+    writer: &mut W,
+) -> Result<(), anyhow::Error> {
+    let mut project_root: Option<PathBuf> = None;
+
+    while let Some(record) = stream.next_record()? {
+        match record {
+            BxlRecord::ProjectRoot {
+                project_root: root,
+            } => {
+                project_root = Some(root);
+            }
+            BxlRecord::Diagnostic {
+                diagnostic_path,
+                target,
+            } => {
+                let root = project_root.as_deref().context(
+                    "BXL emitted a diagnostic record before the project_root header",
+                )?;
+                forward_target(&diagnostic_path, &target, root, writer)?;
+            }
+        }
+    }
+
+    stream.finish()?;
+    Ok(())
+}
+
+fn forward_target<W: Write>(
+    diagnostic_path: &Path,
+    target: &str,
+    project_root: &Path,
+    writer: &mut W,
+) -> Result<(), anyhow::Error> {
+    let contents = std::fs::read_to_string(diagnostic_path).with_context(|| {
+        format!(
+            "reading diagnostic JSON for {target} at {}",
+            diagnostic_path.display(),
+        )
+    })?;
+
+    for line in contents.lines() {
+        // rustc emits one JSON message per line. File paths inside are
+        // relative to the buck project root; promote them to absolute paths
+        // so rust-analyzer can resolve them against its VFS regardless of
+        // cwd.
+        if let Ok(mut message) = serde_json::from_str::<diagnostics::Message>(line) {
+            make_message_absolute(&mut message, project_root);
+            let envelope = json!({
+                "reason": "compiler-message",
+                "package_id": target,
+                "manifest_path": "",
+                "target": cargo_target_stub(target),
+                "message": message,
+            });
+            writeln!(writer, "{}", serde_json::to_string(&envelope)?)?;
+        } else {
+            // Forward unrecognised lines verbatim — rust-analyzer may
+            // understand things we don't, and silently dropping would hide
+            // information.
+            writeln!(writer, "{line}")?;
+        }
+    }
+
+    // Per-target sentinel: triggers `CheckMessage::CompilerArtifact` in
+    // flycheck (crates/rust-analyzer/src/flycheck.rs), which is what
+    // actually clears stale diagnostics for this target.
+    let artifact = json!({
+        "reason": "compiler-artifact",
+        "package_id": target,
+        "manifest_path": "",
+        "target": cargo_target_stub(target),
+        "profile": {
+            "opt_level": "0",
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": false,
+        },
+        "features": [],
+        "filenames": [],
+        "executable": null,
+        "fresh": false,
+    });
+    writeln!(writer, "{}", serde_json::to_string(&artifact)?)?;
+    writer.flush()?;
+
+    Ok(())
+}
+
+/// Minimal `cargo_metadata::Target` stub. flycheck only reads `name` and
+/// `kind` for display; the other fields are required by the deserializer
+/// but their values don't influence rust-analyzer behavior.
+fn cargo_target_stub(target: &str) -> serde_json::Value {
+    json!({
+        "name": target,
+        "kind": ["lib"],
+        "crate_types": ["lib"],
+        "required-features": [],
+        "src_path": "",
+        "edition": "2021",
+        "doctest": false,
+        "test": false,
+        "doc": false,
+    })
 }
 
 fn make_message_absolute(message: &mut diagnostics::Message, base_dir: &Path) {

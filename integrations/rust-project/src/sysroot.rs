@@ -92,6 +92,7 @@ pub(crate) fn resolve_buckconfig_sysroot(
         false,
         false,
         false,
+        &[], // sysroot project doesn't get an always-check allow-list
         &[], // sysroot doesn't get any extra cfgs
     )?;
     for krate in &mut sysroot_project.crates {

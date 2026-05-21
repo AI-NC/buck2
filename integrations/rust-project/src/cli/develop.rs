@@ -40,6 +40,10 @@ pub(crate) struct Develop {
     pub(crate) invoked_by_ra: bool,
     pub(crate) include_all_buildfiles: bool,
     pub(crate) use_clippy: bool,
+    /// Baked into the `RunnableKind::Flycheck` command in the generated
+    /// `rust-project.json` so each flycheck invocation checks these patterns
+    /// alongside the saved file's owning target.
+    pub(crate) always_check: Vec<String>,
 }
 
 pub(crate) struct OutputCfg {
@@ -106,6 +110,13 @@ impl Develop {
                 invoked_by_ra: false,
                 include_all_buildfiles,
                 use_clippy,
+                // `Command::Develop` doesn't surface `--always-check` on its
+                // CLI today — the expected entry point for the allow-list is
+                // `discoverConfig` (`Command::DevelopJson`). If someone needs
+                // to generate a rust-project.json with a baked-in allow-list
+                // via plain `rust-project develop`, mirror the clap field
+                // from `Command::DevelopJson` and thread it through here.
+                always_check: Vec::new(),
             };
             let max_extra_targets = max_extra_targets.unwrap_or(DEFAULT_EXTRA_TARGETS);
             let out = OutputCfg {
@@ -131,6 +142,7 @@ impl Develop {
             max_extra_targets,
             mode,
             use_clippy,
+            always_check,
             ..
         } = command
         {
@@ -165,6 +177,7 @@ impl Develop {
                 invoked_by_ra: true,
                 include_all_buildfiles: false,
                 use_clippy,
+                always_check,
             };
             let max_extra_targets = max_extra_targets.unwrap_or(DEFAULT_EXTRA_TARGETS);
             let out = OutputCfg {
@@ -295,6 +308,7 @@ impl Develop {
             check_cycles,
             include_all_buildfiles,
             use_clippy,
+            always_check,
             ..
         } = self;
 
@@ -328,6 +342,7 @@ impl Develop {
             *check_cycles,
             *include_all_buildfiles,
             *use_clippy,
+            always_check,
             extra_cfgs,
         )
     }
@@ -355,6 +370,7 @@ pub(crate) fn develop_with_sysroot(
     check_cycles: bool,
     include_all_buildfiles: bool,
     use_clippy: bool,
+    always_check: &[String],
     extra_cfgs: &[String],
 ) -> Result<ProjectJson, anyhow::Error> {
     info!(kind = "progress", "building generated code");
@@ -372,6 +388,7 @@ pub(crate) fn develop_with_sysroot(
         check_cycles,
         include_all_buildfiles,
         use_clippy,
+        always_check,
         extra_cfgs,
         buck,
     )?;

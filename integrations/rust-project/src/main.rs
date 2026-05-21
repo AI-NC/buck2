@@ -168,6 +168,13 @@ enum Command {
         #[clap(short = 'c', long, default_value = "true", action = ArgAction::Set)]
         use_clippy: bool,
 
+        /// Allow-list of buck target patterns to bake into the flycheck
+        /// command produced in `rust-project.json` — these are checked on
+        /// every save in addition to the saved file's owning target. Pass
+        /// once per pattern.
+        #[clap(long = "always-check", value_name = "PATTERN")]
+        always_check: Vec<String>,
+
         args: JsonArguments,
     },
     /// Build the saved file's owning target. This is meant to be used by IDEs to provide diagnostics on save.
@@ -188,6 +195,12 @@ enum Command {
         /// Command used to run `buck2`. Defaults to `"buck2"`.
         #[clap(long)]
         buck2_command: Option<String>,
+
+        /// Allow-list of buck target patterns to check on every save in
+        /// addition to the saved file's owning target. Repeat the flag once
+        /// per pattern: `--always-check //foo/... --always-check //bar:lib`.
+        #[clap(long = "always-check", value_name = "PATTERN")]
+        always_check: Vec<String>,
 
         /// The target the users wishes to check. Contains a ":" character.
         /// OR
@@ -338,6 +351,7 @@ fn main() -> Result<(), anyhow::Error> {
             use_clippy,
             buck2_command,
             target_or_saved_file,
+            always_check,
             ..
         } => {
             let subscriber = tracing_subscriber::registry().with(fmt.with_filter(filter));
@@ -345,7 +359,7 @@ fn main() -> Result<(), anyhow::Error> {
 
             let buck = Buck::new(buck2_command, mode);
 
-            cli::Check::new(buck, use_clippy, target_or_saved_file.clone())
+            cli::Check::new(buck, use_clippy, target_or_saved_file.clone(), always_check)
                 .run()
                 .inspect_err(|e| {
                     crate::scuba::log_check_error(&e, &target_or_saved_file, use_clippy)
@@ -423,6 +437,25 @@ fn test_parse_use_clippy() {
 }
 
 #[test]
+fn test_parse_always_check() {
+    let parsed = Opt::try_parse_from([
+        "rust-project",
+        "check",
+        "--always-check",
+        "//foo/...",
+        "--always-check",
+        "//bar:lib",
+        "fbcode/foo.rs",
+    ])
+    .expect("Unable to parse args");
+
+    let Some(Command::Check { always_check, .. }) = parsed.command else {
+        panic!("expected Command::Check");
+    };
+    assert_eq!(always_check, vec!["//foo/...".to_owned(), "//bar:lib".to_owned()]);
+}
+
+#[test]
 #[ignore]
 fn json_args_pass() {
     let args = JsonArguments::Path(PathBuf::from("buck2/integrations/rust-project/src/main.rs"));
@@ -435,6 +468,7 @@ fn json_args_pass() {
             max_extra_targets: None,
             mode: None,
             use_clippy: true,
+            always_check: vec![],
         }),
         version: false,
     };
@@ -456,6 +490,7 @@ fn json_args_pass() {
             max_extra_targets: None,
             mode: None,
             use_clippy: true,
+            always_check: vec![],
         }),
         version: false,
     };
@@ -477,6 +512,7 @@ fn json_args_pass() {
             max_extra_targets: None,
             mode: None,
             use_clippy: true,
+            always_check: vec![],
         }),
         version: false,
     };

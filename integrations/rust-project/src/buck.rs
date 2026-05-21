@@ -11,8 +11,12 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Child;
+use std::process::ChildStdout;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Output;
@@ -56,6 +60,7 @@ pub(crate) fn to_project_json(
     check_cycles: bool,
     include_all_buildfiles: bool,
     use_clippy: bool,
+    always_check: &[String],
     extra_cfgs: &[String],
     buck: &Buck,
 ) -> Result<ProjectJson, anyhow::Error> {
@@ -243,11 +248,18 @@ pub(crate) fn to_project_json(
                 kind: RunnableKind::Flycheck,
                 program: rust_project_executable,
                 args: {
-                    let mut args = vec!["check".to_owned(), "{label}".to_owned()];
+                    let mut args = vec!["check".to_owned()];
                     if !use_clippy {
                         args.push("--use-clippy".to_owned());
                         args.push("false".to_owned());
                     }
+                    for pattern in always_check {
+                        args.push("--always-check".to_owned());
+                        args.push(pattern.clone());
+                    }
+                    // `{label}` is a positional and must come after flags so
+                    // it isn't consumed as a value for `--always-check`.
+                    args.push("{label}".to_owned());
                     args
                 },
                 cwd: project_root.clone(),
@@ -590,12 +602,22 @@ impl Buck {
     }
 
     /// Determines the owning target(s) of the saved file and builds them.
-    #[instrument]
+    ///
+    /// Returns a [`CheckStream`] that yields one [`BxlRecord`] per BXL output
+    /// line — diagnostics flow in as each target's rustc completes rather than
+    /// after the whole BXL invocation finishes.
+    ///
+    /// `always_check` is a user-supplied allow-list of buck target patterns
+    /// (e.g. `//foo/...`, `//bar:lib`) that should be checked on every save
+    /// regardless of which file changed. The union of these and the saved
+    /// file's owning targets is built and analysed in a single BXL run.
+    #[instrument(skip(always_check))]
     pub(crate) fn check_saved_file(
         &self,
         use_clippy: bool,
         saved_file: &Path,
-    ) -> Result<CheckOutput, anyhow::Error> {
+        always_check: &[String],
+    ) -> Result<CheckStream, anyhow::Error> {
         let mut command = self.command(["bxl"]);
 
         if let Some(mode) = &self.mode {
@@ -609,6 +631,7 @@ impl Buck {
         command.args(["--file"]);
         command.arg(saved_file.as_os_str());
         command.args(["--use-clippy", &use_clippy.to_string()]);
+        append_always_check_args(&mut command, always_check);
 
         // Set working directory to the containing directory of the target file.
         // This fixes cases where the working directory happens to be an
@@ -619,18 +642,16 @@ impl Buck {
 
         tracing::debug!(?command, "running bxl");
 
-        let output = command.output();
-
-        let files = deserialize_output(output, &command)?;
-        Ok(files)
+        CheckStream::spawn(command)
     }
 
-    #[instrument(fields(use_clippy, target = %target))]
+    #[instrument(fields(use_clippy, target = %target), skip(always_check))]
     pub(crate) fn check_target(
         &self,
         use_clippy: bool,
         target: &Target,
-    ) -> Result<CheckOutput, anyhow::Error> {
+        always_check: &[String],
+    ) -> Result<CheckStream, anyhow::Error> {
         let mut command = self.command(["bxl"]);
 
         if let Some(mode) = &self.mode {
@@ -643,13 +664,11 @@ impl Buck {
         command.arg("--target");
         command.arg(target);
         command.args(["--use-clippy", &use_clippy.to_string()]);
+        append_always_check_args(&mut command, always_check);
 
         tracing::debug!(?command, "running bxl");
 
-        let output = command.output();
-
-        let files = deserialize_output(output, &command)?;
-        Ok(files)
+        CheckStream::spawn(command)
     }
 
     #[instrument(skip_all)]
@@ -858,10 +877,130 @@ impl Buck {
     }
 }
 
+/// Append `--always-check <pattern>` once per pattern.
+///
+/// The BXL declares `always-check` as `cli_args.list(...)`, which on the buck2
+/// CLI means one occurrence of the flag per element (not a comma-joined list).
+fn append_always_check_args(command: &mut Command, patterns: &[String]) {
+    for pattern in patterns {
+        command.args(["--always-check", pattern]);
+    }
+}
+
+/// One newline-delimited JSON object emitted by `check.bxl`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct CheckOutput {
-    pub(crate) diagnostic_paths: Vec<PathBuf>,
-    pub(crate) project_root: PathBuf,
+#[serde(untagged)]
+pub(crate) enum BxlRecord {
+    /// Header record. Streamed once, immediately, before any diagnostic record.
+    ProjectRoot { project_root: PathBuf },
+    /// One per target, streamed in completion order as each target's diag_json
+    /// artifact is materialized.
+    Diagnostic {
+        diagnostic_path: PathBuf,
+        target: String,
+    },
+}
+
+/// Spawned BXL process plus a line-buffered reader over its stdout.
+///
+/// Yields one [`BxlRecord`] per line via `.next()`. On EOF the child is reaped
+/// and a non-zero status that doesn't look like a rustc ICE is treated as
+/// normal completion (mirrors the legacy `deserialize_output` policy).
+pub(crate) struct CheckStream {
+    /// Held so we can reap on EOF and surface stderr on hard failures.
+    child: Child,
+    /// `Some` until EOF; taken when iteration completes so the borrow ends
+    /// before we call `wait_with_output` on `child` in [`CheckStream::finish`].
+    stdout: Option<BufReader<ChildStdout>>,
+    /// Saved for error-reporting context after `child` is consumed.
+    command_dbg: String,
+}
+
+impl CheckStream {
+    fn spawn(mut command: Command) -> Result<Self, anyhow::Error> {
+        // stderr inherits so BXL progress messages flow to the user's terminal
+        // live. Piping it would risk dead-locking the child on a full stderr
+        // buffer during long workspace checks, since we only drain on EOF.
+        command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+        let command_dbg = format!("{command:?}");
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn `{command_dbg}`"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("spawned child had no piped stdout")?;
+
+        Ok(Self {
+            child,
+            stdout: Some(BufReader::new(stdout)),
+            command_dbg,
+        })
+    }
+
+    /// Reads the next BXL record. Returns `Ok(None)` at EOF.
+    ///
+    /// Blank lines and lines that fail to parse as a [`BxlRecord`] are skipped
+    /// — the BXL only ever emits objects we know about, but a defensive parser
+    /// keeps us robust to future additions.
+    pub(crate) fn next_record(&mut self) -> Result<Option<BxlRecord>, anyhow::Error> {
+        let Some(stdout) = self.stdout.as_mut() else {
+            return Ok(None);
+        };
+
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stdout
+                .read_line(&mut line)
+                .with_context(|| format!("reading stdout of `{}`", self.command_dbg))?;
+            if n == 0 {
+                self.stdout = None;
+                return Ok(None);
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            match serde_json::from_str::<BxlRecord>(trimmed) {
+                Ok(record) => return Ok(Some(record)),
+                Err(err) => {
+                    tracing::warn!(?err, line = trimmed, "skipping unparseable bxl line");
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Wait for the BXL process to exit.
+    ///
+    /// Non-zero exits are logged but not propagated — mirrors the legacy
+    /// `deserialize_output` policy, which accepted non-zero exits when stdout
+    /// parsed cleanly. Since stderr is inherited, any rustc ICE panic message
+    /// has already been shown to the user directly.
+    pub(crate) fn finish(mut self) -> Result<(), anyhow::Error> {
+        // Drop the stdout reader so the child can flush and exit even if the
+        // caller didn't fully drain it.
+        self.stdout = None;
+
+        let status = self
+            .child
+            .wait()
+            .with_context(|| format!("waiting on `{}`", self.command_dbg))?;
+
+        if !status.success() {
+            tracing::debug!(
+                %status,
+                "bxl exited non-zero; stderr was inherited and any panic message is already visible",
+            );
+        }
+
+        Ok(())
+    }
 }
 
 pub(crate) fn utf8_output(

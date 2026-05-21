@@ -8,57 +8,100 @@
 
 load("@prelude//rust:outputs.bzl", "RustcExtraOutputsInfo")
 
-def _check_targets_impl(ctx: bxl.Context) -> list[bxl.EnsuredArtifact]:
+_RUST_KINDS = "^(rust_binary|rust_library|rust_test)$"
+
+def _resolve_primary_nodes(ctx: bxl.Context):
+    """Targets implied by the saved file / explicit target. Same logic as before."""
     if ctx.cli_args.target != None:
-        uquery_targets = ctx.uquery().kind("^(rust_binary|rust_library|rust_test)$", ctx.cli_args.target)
+        uquery_targets = ctx.uquery().kind(_RUST_KINDS, ctx.cli_args.target)
         target_universe = ctx.target_universe(uquery_targets)
-        nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", target_universe.target_set())
+        return ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
     elif ctx.cli_args.file != None:
         uquery_owners = ctx.uquery().owner(ctx.cli_args.file)
         target_universe = ctx.target_universe(uquery_owners)
         owners = ctx.cquery().owner(ctx.cli_args.file, target_universe.target_set())
-        nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", owners)
+        return ctx.cquery().kind(_RUST_KINDS, owners)
+    return None
 
-    if len(nodes) == 0:
+def _resolve_always_check_nodes(ctx: bxl.Context):
+    """Targets matching the user-configured `--always-check` patterns.
+
+    Returns `None` when no patterns were passed so callers can skip the
+    cquery+universe overhead.
+    """
+    pattern_lists = ctx.cli_args.always_check
+    if pattern_lists == None or len(pattern_lists) == 0:
+        return None
+    # `cli_args.list(cli_args.target_expr())` yields one inner list per
+    # `--always-check` occurrence — flatten before feeding the universe.
+    targets = [t for sublist in pattern_lists for t in sublist]
+    if len(targets) == 0:
+        return None
+    target_universe = ctx.target_universe(targets)
+    return ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
+
+def _resolve_nodes(ctx: bxl.Context):
+    """Union of primary targets (file/target) and always-check patterns.
+
+    Either may be empty; we return the union with no further dedup because
+    `ctx.analysis()` keys by `ConfiguredProvidersLabel` and naturally collapses
+    duplicate labels in its result dict.
+    """
+    primary = _resolve_primary_nodes(ctx)
+    extra = _resolve_always_check_nodes(ctx)
+    if primary == None and extra == None:
         return []
+    if primary == None:
+        return extra
+    if extra == None:
+        return primary
+    return primary + extra
 
-    analysis = ctx.analysis(nodes).values()
+def _run(ctx: bxl.Context) -> None:
+    # Emit the project_root header first so the consumer can parse it before
+    # any per-target diagnostic record arrives. No `wait_on` -> streams
+    # immediately during evaluation.
+    #
+    # `pretty = False` is load-bearing: the consumer reads stdout line by line
+    # and `stream_json` defaults to pretty-printing (multi-line) JSON.
+    ctx.output.stream_json({"project_root": ctx.root()}, pretty = False)
 
-    artifacts = []
-    for a in analysis:
+    nodes = _resolve_nodes(ctx)
+    if len(nodes) == 0:
+        return
+
+    analysis_by_label = ctx.analysis(nodes)
+
+    for label, a in analysis_by_label.items():
         o = a.providers()[RustcExtraOutputsInfo]
         # Temporarily disabled due to ICE reports in https://fb.workplace.com/groups/rust.analyzer/posts/1512577186779084
         # and https://github.com/rust-lang/rust/issues/141540
         # if ctx.cli_args.use_clippy:
-        #     artifacts.append(o.clippy_incr.diag_json)
+        #     artifact = o.clippy_incr.diag_json
         # else:
-        #     artifacts.append(o.metadata_incr.diag_json)
-
+        #     artifact = o.metadata_incr.diag_json
         if ctx.cli_args.use_clippy:
-            artifacts.append(o.clippy.diag_json)
+            artifact = o.clippy.diag_json
         else:
-            artifacts.append(o.metadata.diag_json)
+            artifact = o.metadata.diag_json
 
-    art_output = ctx.output.ensure_multiple(artifacts)
-
-    return [
-        artifact.abs_path()
-        for artifact in art_output
-    ]
-
-def _run(ctx: bxl.Context) -> None:
-    diagnostic_paths = _check_targets_impl(ctx)
-
-    out = {
-        "diagnostic_paths": diagnostic_paths,
-        "project_root": ctx.root(),
-    }
-
-    ctx.output.print_json(out)
+        ensured = ctx.output.ensure(artifact)
+        ctx.output.stream_json(
+            {
+                "diagnostic_path": ensured.abs_path(),
+                "target": str(label.raw_target()),
+            },
+            pretty = False,
+            wait_on = [ensured],
+        )
 
 check = bxl_main(
     impl = _run,
     cli_args = {
+        # User-configured allow-list of target patterns that should be checked
+        # alongside the saved-file's owning target(s). Pass once per pattern:
+        # `--always-check //foo/... --always-check //bar:lib`.
+        "always-check": cli_args.option(cli_args.list(cli_args.target_expr())),
         "file": cli_args.option(cli_args.string()),
         "target": cli_args.option(cli_args.target_label()),
         "use-clippy": cli_args.bool(),
