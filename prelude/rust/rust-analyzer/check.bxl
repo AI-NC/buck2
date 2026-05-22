@@ -10,46 +10,95 @@ load("@prelude//rust:outputs.bzl", "RustcExtraOutputsInfo")
 
 _RUST_KINDS = "^(rust_binary|rust_library|rust_test)$"
 
-def _augment_with_test_companions(ctx: bxl.Context, nodes):
-    """Pull in any test targets registered on `nodes` via the `tests` attr.
+# Ordered sibling-inclusion levels. Each level is a superset of the previous:
+#   none     - only the exact resolved target(s).
+#   unittest - + the auto-generated `*-unittest` rust_test companion of each lib.
+#   tests    - + every entry in each lib's `tests` attribute (incl. integration tests).
+#   package  - + every rust_{binary,library,test} declared in the same BUCK file.
+_SIBLING_LEVELS = ["none", "unittest", "tests", "package"]
 
-    `rust_library` macros (e.g. ainc's) auto-generate a `-unittest` rust_test
-    companion and wire it via `tests = [":foo-unittest"]` on the lib. Resolving
-    just the lib misses those test sources; rust-analyzer then has no flycheck
-    diagnostics for code inside `#[cfg(test)] mod tests`. Walk each node's
-    `tests` attr and union the referenced test targets in.
+def _tests_attr_labels(nodes, suffix_filter):
+    """Return the labels referenced by each node's `tests` attr.
+
+    `suffix_filter`: if non-None, only include refs whose label string ends with
+    this suffix. Used to narrow `tests` to just `-unittest` companions.
     """
-    test_labels = []
+    out = []
     for node in nodes:
         attr_value = node.get_attr("tests")
         if attr_value == None:
             continue
         for test_ref in attr_value:
-            test_labels.append(test_ref.raw_target())
-    if len(test_labels) == 0:
+            label = test_ref.raw_target()
+            if suffix_filter == None or str(label).endswith(suffix_filter):
+                out.append(label)
+    return out
+
+def _package_patterns(nodes):
+    """`{cell}//{package}:` patterns covering each node's BUCK file."""
+    seen = {}
+    for node in nodes:
+        lbl = node.label
+        seen[lbl.cell + "//" + lbl.package + ":"] = None
+    return list(seen.keys())
+
+def _augment_with_siblings(ctx: bxl.Context, nodes, level: str):
+    """Union `nodes` with sibling targets per `level` (see `_SIBLING_LEVELS`).
+
+    `rust_library` macros (e.g. ainc's) auto-generate a `-unittest` rust_test
+    companion and wire it via `tests = [":foo-unittest"]` on the lib. Resolving
+    just the lib misses those test sources; rust-analyzer then has no flycheck
+    diagnostics for code inside `#[cfg(test)] mod tests`. The default
+    `unittest` level closes that gap; higher levels widen the scope further at
+    proportional build cost.
+    """
+    if level == "none" or len(nodes) == 0:
         return nodes
-    test_universe = ctx.target_universe(test_labels)
-    test_nodes = ctx.cquery().kind(_RUST_KINDS, test_universe.target_set())
-    return nodes + test_nodes
+
+    if level == "unittest":
+        extra_labels = _tests_attr_labels(nodes, suffix_filter = "-unittest")
+        if len(extra_labels) == 0:
+            return nodes
+        universe = ctx.target_universe(extra_labels)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    if level == "tests":
+        extra_labels = _tests_attr_labels(nodes, suffix_filter = None)
+        if len(extra_labels) == 0:
+            return nodes
+        universe = ctx.target_universe(extra_labels)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    if level == "package":
+        patterns = _package_patterns(nodes)
+        if len(patterns) == 0:
+            return nodes
+        universe = ctx.target_universe(patterns)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    fail("unknown --include-siblings level: %s (expected one of %s)" % (level, _SIBLING_LEVELS))
 
 def _resolve_primary_nodes(ctx: bxl.Context):
     """Targets implied by the saved file / explicit target.
 
-    `--file` resolves via `uquery.owner()`, which already returns both the lib
-    and any companion `-unittest` test target (both own the same srcs).
-    `--target` only resolves the exact label, so we augment with `tests`
-    companions to keep behavior consistent across both invocation paths.
+    Sibling inclusion is centralised through `_augment_with_siblings` so the
+    `--file` and `--target` invocation paths agree. `uquery.owner()` naturally
+    pulls in the `-unittest` companion (both targets own the same srcs), so for
+    consistency we strip back to just the file's lib-owners first and then
+    re-augment via the chosen sibling level.
     """
+    level = ctx.cli_args.include_siblings
     if ctx.cli_args.target != None:
         uquery_targets = ctx.uquery().kind(_RUST_KINDS, ctx.cli_args.target)
         target_universe = ctx.target_universe(uquery_targets)
         nodes = ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
-        return _augment_with_test_companions(ctx, nodes)
+        return _augment_with_siblings(ctx, nodes, level)
     elif ctx.cli_args.file != None:
         uquery_owners = ctx.uquery().owner(ctx.cli_args.file)
         target_universe = ctx.target_universe(uquery_owners)
         owners = ctx.cquery().owner(ctx.cli_args.file, target_universe.target_set())
-        return ctx.cquery().kind(_RUST_KINDS, owners)
+        nodes = ctx.cquery().kind(_RUST_KINDS, owners)
+        return _augment_with_siblings(ctx, nodes, level)
     return None
 
 def _resolve_always_check_nodes(ctx: bxl.Context):
@@ -132,6 +181,9 @@ check = bxl_main(
         # `--always-check //foo/... --always-check //bar:lib`.
         "always-check": cli_args.option(cli_args.list(cli_args.target_expr())),
         "file": cli_args.option(cli_args.string()),
+        # How widely to expand the saved-file's owning target(s). See
+        # `_SIBLING_LEVELS` for the supported values and what each pulls in.
+        "include-siblings": cli_args.enum(_SIBLING_LEVELS, default = "unittest"),
         "target": cli_args.option(cli_args.target_label()),
         "use-clippy": cli_args.bool(),
     },

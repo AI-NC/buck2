@@ -19,6 +19,7 @@ use crate::buck;
 use crate::buck::Buck;
 use crate::buck::BxlRecord;
 use crate::buck::CheckStream;
+use crate::buck::IncludeSiblings;
 use crate::cli::TargetOrFile;
 use crate::diagnostics;
 
@@ -29,6 +30,8 @@ pub(crate) struct Check {
     /// Buck target patterns that should be checked on every save in addition
     /// to the saved file's owning target.
     pub(crate) always_check: Vec<String>,
+    /// How widely to expand the saved-file's owning target(s).
+    pub(crate) include_siblings: IncludeSiblings,
 }
 
 impl Check {
@@ -37,6 +40,7 @@ impl Check {
         use_clippy: bool,
         target_or_saved_file: TargetOrFile,
         always_check: Vec<String>,
+        include_siblings: IncludeSiblings,
     ) -> Self {
         let target_or_saved_file = target_or_saved_file.canonicalize();
 
@@ -45,6 +49,7 @@ impl Check {
             use_clippy,
             target_or_saved_file,
             always_check,
+            include_siblings,
         }
     }
 
@@ -54,12 +59,18 @@ impl Check {
         let buck = &self.buck;
 
         let stream = match &self.target_or_saved_file {
-            TargetOrFile::Target(target) => {
-                buck.check_target(self.use_clippy, target, &self.always_check)?
-            }
-            TargetOrFile::File(saved_file) => {
-                buck.check_saved_file(self.use_clippy, saved_file, &self.always_check)?
-            }
+            TargetOrFile::Target(target) => buck.check_target(
+                self.use_clippy,
+                target,
+                &self.always_check,
+                self.include_siblings,
+            )?,
+            TargetOrFile::File(saved_file) => buck.check_saved_file(
+                self.use_clippy,
+                saved_file,
+                &self.always_check,
+                self.include_siblings,
+            )?,
         };
 
         // Lock stdout for the duration of the stream so partial diagnostic

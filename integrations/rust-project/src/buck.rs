@@ -53,6 +53,40 @@ use crate::target::TargetInfo;
 #[cfg(fbcode_build)]
 const CLIENT_METADATA_RUST_PROJECT: &str = "--client-metadata=id=rust-project";
 
+/// How widely `rust-project check` should expand the saved-file's owning
+/// target(s). Maps onto the `--include-siblings` argument of the BXL.
+///
+/// Levels are ordered widest-last; each is a superset of the previous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IncludeSiblings {
+    /// Only the exact resolved target(s).
+    None,
+    /// Lib + auto-generated `*-unittest` companion. Default.
+    Unittest,
+    /// Lib + every entry in its `tests` attr (incl. integration tests).
+    Tests,
+    /// Lib + every rust target declared in the same BUCK file.
+    Package,
+}
+
+impl IncludeSiblings {
+    /// CLI representation, also the value passed through to the BXL.
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unittest => "unittest",
+            Self::Tests => "tests",
+            Self::Package => "package",
+        }
+    }
+}
+
+impl Default for IncludeSiblings {
+    fn default() -> Self {
+        Self::Unittest
+    }
+}
+
 pub(crate) fn to_project_json(
     sysroot: Sysroot,
     expanded_and_resolved: ExpandedAndResolved,
@@ -61,6 +95,7 @@ pub(crate) fn to_project_json(
     include_all_buildfiles: bool,
     use_clippy: bool,
     always_check: &[String],
+    include_siblings: IncludeSiblings,
     extra_cfgs: &[String],
     buck: &Buck,
 ) -> Result<ProjectJson, anyhow::Error> {
@@ -252,6 +287,13 @@ pub(crate) fn to_project_json(
                     if !use_clippy {
                         args.push("--use-clippy".to_owned());
                         args.push("false".to_owned());
+                    }
+                    // Omit when default so the generated rust-project.json
+                    // stays minimal; non-default choices are baked in so the
+                    // flycheck command reflects what the user configured.
+                    if include_siblings != IncludeSiblings::default() {
+                        args.push("--include-siblings".to_owned());
+                        args.push(include_siblings.as_cli_str().to_owned());
                     }
                     for pattern in always_check {
                         args.push("--always-check".to_owned());
@@ -617,6 +659,7 @@ impl Buck {
         use_clippy: bool,
         saved_file: &Path,
         always_check: &[String],
+        include_siblings: IncludeSiblings,
     ) -> Result<CheckStream, anyhow::Error> {
         let mut command = self.command(["bxl"]);
 
@@ -631,6 +674,7 @@ impl Buck {
         command.args(["--file"]);
         command.arg(saved_file.as_os_str());
         command.args(["--use-clippy", &use_clippy.to_string()]);
+        command.args(["--include-siblings", include_siblings.as_cli_str()]);
         append_always_check_args(&mut command, always_check);
 
         // Set working directory to the containing directory of the target file.
@@ -651,6 +695,7 @@ impl Buck {
         use_clippy: bool,
         target: &Target,
         always_check: &[String],
+        include_siblings: IncludeSiblings,
     ) -> Result<CheckStream, anyhow::Error> {
         let mut command = self.command(["bxl"]);
 
@@ -664,6 +709,7 @@ impl Buck {
         command.arg("--target");
         command.arg(target);
         command.args(["--use-clippy", &use_clippy.to_string()]);
+        command.args(["--include-siblings", include_siblings.as_cli_str()]);
         append_always_check_args(&mut command, always_check);
 
         tracing::debug!(?command, "running bxl");

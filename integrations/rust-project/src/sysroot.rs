@@ -93,6 +93,7 @@ pub(crate) fn resolve_buckconfig_sysroot(
         false,
         false,
         &[], // sysroot project doesn't get an always-check allow-list
+        crate::buck::IncludeSiblings::None, // sysroot project: no sibling expansion
         &[], // sysroot doesn't get any extra cfgs
     )?;
     for krate in &mut sysroot_project.crates {

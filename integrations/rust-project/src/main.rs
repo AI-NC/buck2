@@ -175,6 +175,15 @@ enum Command {
         #[clap(long = "always-check", value_name = "PATTERN")]
         always_check: Vec<String>,
 
+        /// How widely to expand the saved-file's owning target(s) when
+        /// running flycheck. `unittest` (default) adds the auto-generated
+        /// `-unittest` companion; `tests` adds every entry in the lib's
+        /// `tests` attr; `package` adds every rust target in the same BUCK
+        /// file. Baked into the flycheck command produced in
+        /// `rust-project.json`.
+        #[clap(long = "include-siblings", value_enum, default_value = "unittest")]
+        include_siblings: buck::IncludeSiblings,
+
         args: JsonArguments,
     },
     /// Build the saved file's owning target. This is meant to be used by IDEs to provide diagnostics on save.
@@ -201,6 +210,13 @@ enum Command {
         /// per pattern: `--always-check //foo/... --always-check //bar:lib`.
         #[clap(long = "always-check", value_name = "PATTERN")]
         always_check: Vec<String>,
+
+        /// How widely to expand the saved-file's owning target(s).
+        /// `unittest` (default) adds the auto-generated `-unittest`
+        /// companion; `tests` adds every entry in the lib's `tests` attr;
+        /// `package` adds every rust target in the same BUCK file.
+        #[clap(long = "include-siblings", value_enum, default_value = "unittest")]
+        include_siblings: buck::IncludeSiblings,
 
         /// The target the users wishes to check. Contains a ":" character.
         /// OR
@@ -352,6 +368,7 @@ fn main() -> Result<(), anyhow::Error> {
             buck2_command,
             target_or_saved_file,
             always_check,
+            include_siblings,
             ..
         } => {
             let subscriber = tracing_subscriber::registry().with(fmt.with_filter(filter));
@@ -359,11 +376,15 @@ fn main() -> Result<(), anyhow::Error> {
 
             let buck = Buck::new(buck2_command, mode);
 
-            cli::Check::new(buck, use_clippy, target_or_saved_file.clone(), always_check)
-                .run()
-                .inspect_err(|e| {
-                    crate::scuba::log_check_error(&e, &target_or_saved_file, use_clippy)
-                })
+            cli::Check::new(
+                buck,
+                use_clippy,
+                target_or_saved_file.clone(),
+                always_check,
+                include_siblings,
+            )
+            .run()
+            .inspect_err(|e| crate::scuba::log_check_error(&e, &target_or_saved_file, use_clippy))
         }
     }
 }
@@ -469,6 +490,7 @@ fn json_args_pass() {
             mode: None,
             use_clippy: true,
             always_check: vec![],
+            include_siblings: buck::IncludeSiblings::Unittest,
         }),
         version: false,
     };
@@ -491,6 +513,7 @@ fn json_args_pass() {
             mode: None,
             use_clippy: true,
             always_check: vec![],
+            include_siblings: buck::IncludeSiblings::Unittest,
         }),
         version: false,
     };
@@ -513,6 +536,7 @@ fn json_args_pass() {
             mode: None,
             use_clippy: true,
             always_check: vec![],
+            include_siblings: buck::IncludeSiblings::Unittest,
         }),
         version: false,
     };
