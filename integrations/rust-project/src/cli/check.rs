@@ -124,12 +124,39 @@ fn forward_target<W: Write>(
     project_root: &Path,
     writer: &mut W,
 ) -> Result<(), anyhow::Error> {
-    let contents = std::fs::read_to_string(diagnostic_path).with_context(|| {
-        format!(
-            "reading diagnostic JSON for {target} at {}",
-            diagnostic_path.display(),
-        )
-    })?;
+    // `develop-json`'s `merge_unit_test_targets` (buck.rs) folds the generated
+    // `*-unittest` test target into its parent lib in the produced
+    // rust-project.json. The lib's `package_id` is what rust-analyzer indexes
+    // by, so when the flycheck stream tags diagnostics with the unittest's own
+    // label they get dropped on receipt. Strip the suffix here so unittest
+    // diagnostics are attributed to the lib rust-analyzer actually knows about.
+    let report_target = target.strip_suffix("-unittest").unwrap_or(target);
+
+    let contents = match std::fs::read_to_string(diagnostic_path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Buck claimed it materialized the artifact (otherwise `ensure`
+            // would have failed in the BXL), but the file isn't on disk.
+            // Happens when a target's compile fails before it reaches the
+            // diag_json action — e.g. `:foo-unittest` depends on `:foo`,
+            // and `:foo`'s rustc errored first. Skip and keep streaming
+            // diagnostics for the targets that did produce them.
+            tracing::warn!(
+                target,
+                path = %diagnostic_path.display(),
+                "diagnostic JSON missing; target likely failed before emitting one"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "reading diagnostic JSON for {target} at {}",
+                    diagnostic_path.display(),
+                )
+            });
+        }
+    };
 
     for line in contents.lines() {
         // rustc emits one JSON message per line. File paths inside are
@@ -140,9 +167,9 @@ fn forward_target<W: Write>(
             make_message_absolute(&mut message, project_root);
             let envelope = json!({
                 "reason": "compiler-message",
-                "package_id": target,
+                "package_id": report_target,
                 "manifest_path": "",
-                "target": cargo_target_stub(target),
+                "target": cargo_target_stub(report_target),
                 "message": message,
             });
             writeln!(writer, "{}", serde_json::to_string(&envelope)?)?;
@@ -159,9 +186,9 @@ fn forward_target<W: Write>(
     // actually clears stale diagnostics for this target.
     let artifact = json!({
         "reason": "compiler-artifact",
-        "package_id": target,
+        "package_id": report_target,
         "manifest_path": "",
-        "target": cargo_target_stub(target),
+        "target": cargo_target_stub(report_target),
         "profile": {
             "opt_level": "0",
             "debug_assertions": true,
