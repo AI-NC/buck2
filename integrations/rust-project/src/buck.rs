@@ -58,7 +58,7 @@ const CLIENT_METADATA_RUST_PROJECT: &str = "--client-metadata=id=rust-project";
 ///
 /// Levels are ordered widest-last; each is a superset of the previous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum IncludeSiblings {
+pub(crate) enum IncludeSiblings {
     /// Only the exact resolved target(s).
     None,
     /// Lib + auto-generated `*-unittest` companion. Default.
@@ -71,7 +71,7 @@ pub enum IncludeSiblings {
 
 impl IncludeSiblings {
     /// CLI representation, also the value passed through to the BXL.
-    pub fn as_cli_str(self) -> &'static str {
+    pub(crate) fn as_cli_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Unittest => "unittest",
