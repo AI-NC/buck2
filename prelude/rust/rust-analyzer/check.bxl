@@ -118,22 +118,53 @@ def _resolve_always_check_nodes(ctx: bxl.Context):
     target_universe = ctx.target_universe(targets)
     return ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
 
+def _drop_libs_shadowed_by_unittest(nodes):
+    """Filter out any lib whose `-unittest` companion is also in `nodes`.
+
+    `rust_library` and its auto-generated `*-unittest` `rust_test` share the
+    same srcs; the unittest compile is a strict superset of the lib compile
+    (same warnings, same errors, plus the `#[cfg(test)]` contents). Whenever
+    both are in the working set, building the lib is duplicated work — drop
+    it so the unittest carries the diagnostics for both.
+
+    Callers in this codebase rely on the ainc rust_library macro at
+    `buck2/ainc/build_defs/rust_library.bzl`. Crates that don't follow the
+    `:foo` + `:foo-unittest` naming convention are unaffected.
+    """
+    unittest_present = {}
+    for node in nodes:
+        label_str = str(node.label.raw_target())
+        if label_str.endswith("-unittest"):
+            shadowed_lib = label_str[:-len("-unittest")]
+            unittest_present[shadowed_lib] = True
+    if len(unittest_present) == 0:
+        return nodes
+    return [
+        node
+        for node in nodes
+        if str(node.label.raw_target()) not in unittest_present
+    ]
+
 def _resolve_nodes(ctx: bxl.Context):
     """Union of primary targets (file/target) and always-check patterns.
 
-    Either may be empty; we return the union with no further dedup because
-    `ctx.analysis()` keys by `ConfiguredProvidersLabel` and naturally collapses
-    duplicate labels in its result dict.
+    Either may be empty. Exact-duplicate labels (same target appearing in
+    both halves) collapse naturally because `ctx.analysis()` keys by
+    `ConfiguredProvidersLabel`. The final pass drops libs whose `-unittest`
+    companion is in the set (see `_drop_libs_shadowed_by_unittest`) — that
+    one isn't a duplicate of labels, it's a duplicate of compile work.
     """
     primary = _resolve_primary_nodes(ctx)
     extra = _resolve_always_check_nodes(ctx)
     if primary == None and extra == None:
         return []
     if primary == None:
-        return extra
-    if extra == None:
-        return primary
-    return primary + extra
+        merged = extra
+    elif extra == None:
+        merged = primary
+    else:
+        merged = primary + extra
+    return _drop_libs_shadowed_by_unittest(merged)
 
 def _run(ctx: bxl.Context) -> None:
     # Emit the project_root header first so the consumer can parse it before
