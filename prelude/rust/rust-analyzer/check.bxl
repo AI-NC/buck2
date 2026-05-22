@@ -10,12 +10,41 @@ load("@prelude//rust:outputs.bzl", "RustcExtraOutputsInfo")
 
 _RUST_KINDS = "^(rust_binary|rust_library|rust_test)$"
 
+def _augment_with_test_companions(ctx: bxl.Context, nodes):
+    """Pull in any test targets registered on `nodes` via the `tests` attr.
+
+    `rust_library` macros (e.g. ainc's) auto-generate a `-unittest` rust_test
+    companion and wire it via `tests = [":foo-unittest"]` on the lib. Resolving
+    just the lib misses those test sources; rust-analyzer then has no flycheck
+    diagnostics for code inside `#[cfg(test)] mod tests`. Walk each node's
+    `tests` attr and union the referenced test targets in.
+    """
+    test_labels = []
+    for node in nodes:
+        attr_value = node.get_attr("tests")
+        if attr_value == None:
+            continue
+        for test_ref in attr_value:
+            test_labels.append(test_ref.raw_target())
+    if len(test_labels) == 0:
+        return nodes
+    test_universe = ctx.target_universe(test_labels)
+    test_nodes = ctx.cquery().kind(_RUST_KINDS, test_universe.target_set())
+    return nodes + test_nodes
+
 def _resolve_primary_nodes(ctx: bxl.Context):
-    """Targets implied by the saved file / explicit target. Same logic as before."""
+    """Targets implied by the saved file / explicit target.
+
+    `--file` resolves via `uquery.owner()`, which already returns both the lib
+    and any companion `-unittest` test target (both own the same srcs).
+    `--target` only resolves the exact label, so we augment with `tests`
+    companions to keep behavior consistent across both invocation paths.
+    """
     if ctx.cli_args.target != None:
         uquery_targets = ctx.uquery().kind(_RUST_KINDS, ctx.cli_args.target)
         target_universe = ctx.target_universe(uquery_targets)
-        return ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
+        nodes = ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
+        return _augment_with_test_companions(ctx, nodes)
     elif ctx.cli_args.file != None:
         uquery_owners = ctx.uquery().owner(ctx.cli_args.file)
         target_universe = ctx.target_universe(uquery_owners)
