@@ -40,6 +40,14 @@ pub(crate) struct Develop {
     pub(crate) invoked_by_ra: bool,
     pub(crate) include_all_buildfiles: bool,
     pub(crate) use_clippy: bool,
+    /// Baked into the `RunnableKind::Flycheck` command in the generated
+    /// `rust-project.json` so each flycheck invocation checks these patterns
+    /// alongside the saved file's owning target.
+    pub(crate) always_check: Vec<String>,
+    /// Baked into the `RunnableKind::Flycheck` command in the generated
+    /// `rust-project.json`. Controls how widely the saved-file's owning
+    /// target(s) get expanded when flycheck runs.
+    pub(crate) include_siblings: buck::IncludeSiblings,
 }
 
 pub(crate) struct OutputCfg {
@@ -106,6 +114,14 @@ impl Develop {
                 invoked_by_ra: false,
                 include_all_buildfiles,
                 use_clippy,
+                // `Command::Develop` doesn't surface `--always-check` or
+                // `--include-siblings` on its CLI today — the expected entry
+                // point for these is `discoverConfig` (`Command::DevelopJson`).
+                // If someone needs to bake them in via plain
+                // `rust-project develop`, mirror the clap fields from
+                // `Command::DevelopJson` and thread them through here.
+                always_check: Vec::new(),
+                include_siblings: buck::IncludeSiblings::default(),
             };
             let max_extra_targets = max_extra_targets.unwrap_or(DEFAULT_EXTRA_TARGETS);
             let out = OutputCfg {
@@ -131,6 +147,8 @@ impl Develop {
             max_extra_targets,
             mode,
             use_clippy,
+            always_check,
+            include_siblings,
             ..
         } = command
         {
@@ -165,6 +183,8 @@ impl Develop {
                 invoked_by_ra: true,
                 include_all_buildfiles: false,
                 use_clippy,
+                always_check,
+                include_siblings,
             };
             let max_extra_targets = max_extra_targets.unwrap_or(DEFAULT_EXTRA_TARGETS);
             let out = OutputCfg {
@@ -295,8 +315,19 @@ impl Develop {
             check_cycles,
             include_all_buildfiles,
             use_clippy,
+            always_check,
+            include_siblings,
             ..
         } = self;
+
+        // `always_check` is the user-configured allow-list of patterns that
+        // `rust-project check` will build on every save. The same patterns
+        // must also be in the rust-project.json crate graph; otherwise
+        // rust-analyzer drops diagnostics whose `package_id` it doesn't
+        // recognize. Append them to the saved-file-derived targets so
+        // `expand_and_resolve` walks both halves of the dep tree together.
+        let mut targets = targets;
+        targets.extend(always_check.iter().cloned().map(Target::new));
 
         info!(kind = "progress", "finding std source code");
         let sysroot = match &sysroot {
@@ -328,6 +359,8 @@ impl Develop {
             *check_cycles,
             *include_all_buildfiles,
             *use_clippy,
+            always_check,
+            *include_siblings,
             extra_cfgs,
         )
     }
@@ -355,6 +388,8 @@ pub(crate) fn develop_with_sysroot(
     check_cycles: bool,
     include_all_buildfiles: bool,
     use_clippy: bool,
+    always_check: &[String],
+    include_siblings: buck::IncludeSiblings,
     extra_cfgs: &[String],
 ) -> Result<ProjectJson, anyhow::Error> {
     info!(kind = "progress", "building generated code");
@@ -372,6 +407,8 @@ pub(crate) fn develop_with_sysroot(
         check_cycles,
         include_all_buildfiles,
         use_clippy,
+        always_check,
+        include_siblings,
         extra_cfgs,
         buck,
     )?;

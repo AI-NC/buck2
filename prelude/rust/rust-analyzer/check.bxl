@@ -8,58 +8,213 @@
 
 load("@prelude//rust:outputs.bzl", "RustcExtraOutputsInfo")
 
-def _check_targets_impl(ctx: bxl.Context) -> list[bxl.EnsuredArtifact]:
+_RUST_KINDS = "^(rust_binary|rust_library|rust_test)$"
+
+# Ordered sibling-inclusion levels. Each level is a superset of the previous:
+#   none     - only the exact resolved target(s).
+#   unittest - + the auto-generated `*-unittest` rust_test companion of each lib.
+#   tests    - + every entry in each lib's `tests` attribute (incl. integration tests).
+#   package  - + every rust_{binary,library,test} declared in the same BUCK file.
+_SIBLING_LEVELS = ["none", "unittest", "tests", "package"]
+
+def _tests_attr_labels(nodes, suffix_filter):
+    """Return the labels referenced by each node's `tests` attr.
+
+    `suffix_filter`: if non-None, only include refs whose label string ends with
+    this suffix. Used to narrow `tests` to just `-unittest` companions.
+    """
+    out = []
+    for node in nodes:
+        attr_value = node.get_attr("tests")
+        if attr_value == None:
+            continue
+        for test_ref in attr_value:
+            label = test_ref.raw_target()
+            if suffix_filter == None or str(label).endswith(suffix_filter):
+                out.append(label)
+    return out
+
+def _package_patterns(nodes):
+    """`{cell}//{package}:` patterns covering each node's BUCK file."""
+    seen = {}
+    for node in nodes:
+        lbl = node.label
+        seen[lbl.cell + "//" + lbl.package + ":"] = None
+    return list(seen.keys())
+
+def _augment_with_siblings(ctx: bxl.Context, nodes, level: str):
+    """Union `nodes` with sibling targets per `level` (see `_SIBLING_LEVELS`).
+
+    `rust_library` macros (e.g. ainc's) auto-generate a `-unittest` rust_test
+    companion and wire it via `tests = [":foo-unittest"]` on the lib. Resolving
+    just the lib misses those test sources; rust-analyzer then has no flycheck
+    diagnostics for code inside `#[cfg(test)] mod tests`. The default
+    `unittest` level closes that gap; higher levels widen the scope further at
+    proportional build cost.
+    """
+    if level == "none" or len(nodes) == 0:
+        return nodes
+
+    if level == "unittest":
+        extra_labels = _tests_attr_labels(nodes, suffix_filter = "-unittest")
+        if len(extra_labels) == 0:
+            return nodes
+        universe = ctx.target_universe(extra_labels)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    if level == "tests":
+        extra_labels = _tests_attr_labels(nodes, suffix_filter = None)
+        if len(extra_labels) == 0:
+            return nodes
+        universe = ctx.target_universe(extra_labels)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    if level == "package":
+        patterns = _package_patterns(nodes)
+        if len(patterns) == 0:
+            return nodes
+        universe = ctx.target_universe(patterns)
+        return nodes + ctx.cquery().kind(_RUST_KINDS, universe.target_set())
+
+    fail("unknown --include-siblings level: %s (expected one of %s)" % (level, _SIBLING_LEVELS))
+
+def _resolve_primary_nodes(ctx: bxl.Context):
+    """Targets implied by the saved file / explicit target.
+
+    Sibling inclusion is centralised through `_augment_with_siblings` so the
+    `--file` and `--target` invocation paths agree. `uquery.owner()` naturally
+    pulls in the `-unittest` companion (both targets own the same srcs), so for
+    consistency we strip back to just the file's lib-owners first and then
+    re-augment via the chosen sibling level.
+    """
+    level = ctx.cli_args.include_siblings
     if ctx.cli_args.target != None:
-        uquery_targets = ctx.uquery().kind("^(rust_binary|rust_library|rust_test)$", ctx.cli_args.target)
+        uquery_targets = ctx.uquery().kind(_RUST_KINDS, ctx.cli_args.target)
         target_universe = ctx.target_universe(uquery_targets)
-        nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", target_universe.target_set())
+        nodes = ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
+        return _augment_with_siblings(ctx, nodes, level)
     elif ctx.cli_args.file != None:
         uquery_owners = ctx.uquery().owner(ctx.cli_args.file)
         target_universe = ctx.target_universe(uquery_owners)
         owners = ctx.cquery().owner(ctx.cli_args.file, target_universe.target_set())
-        nodes = ctx.cquery().kind("^(rust_binary|rust_library|rust_test)$", owners)
+        nodes = ctx.cquery().kind(_RUST_KINDS, owners)
+        return _augment_with_siblings(ctx, nodes, level)
+    return None
 
-    if len(nodes) == 0:
+def _resolve_always_check_nodes(ctx: bxl.Context):
+    """Targets matching the user-configured `--always-check` patterns.
+
+    Returns `None` when no patterns were passed so callers can skip the
+    cquery+universe overhead.
+    """
+    pattern_lists = ctx.cli_args.always_check
+    if pattern_lists == None or len(pattern_lists) == 0:
+        return None
+    # `cli_args.list(cli_args.target_expr())` yields one inner list per
+    # `--always-check` occurrence — flatten before feeding the universe.
+    targets = [t for sublist in pattern_lists for t in sublist]
+    if len(targets) == 0:
+        return None
+    target_universe = ctx.target_universe(targets)
+    return ctx.cquery().kind(_RUST_KINDS, target_universe.target_set())
+
+def _drop_libs_shadowed_by_unittest(nodes):
+    """Filter out any lib whose `-unittest` companion is also in `nodes`.
+
+    `rust_library` and its auto-generated `*-unittest` `rust_test` share the
+    same srcs; the unittest compile is a strict superset of the lib compile
+    (same warnings, same errors, plus the `#[cfg(test)]` contents). Whenever
+    both are in the working set, building the lib is duplicated work — drop
+    it so the unittest carries the diagnostics for both.
+
+    Callers in this codebase rely on the ainc rust_library macro at
+    `buck2/ainc/build_defs/rust_library.bzl`. Crates that don't follow the
+    `:foo` + `:foo-unittest` naming convention are unaffected.
+    """
+    unittest_present = {}
+    for node in nodes:
+        label_str = str(node.label.raw_target())
+        if label_str.endswith("-unittest"):
+            shadowed_lib = label_str[:-len("-unittest")]
+            unittest_present[shadowed_lib] = True
+    if len(unittest_present) == 0:
+        return nodes
+    return [
+        node
+        for node in nodes
+        if str(node.label.raw_target()) not in unittest_present
+    ]
+
+def _resolve_nodes(ctx: bxl.Context):
+    """Union of primary targets (file/target) and always-check patterns.
+
+    Either may be empty. Exact-duplicate labels (same target appearing in
+    both halves) collapse naturally because `ctx.analysis()` keys by
+    `ConfiguredProvidersLabel`. The final pass drops libs whose `-unittest`
+    companion is in the set (see `_drop_libs_shadowed_by_unittest`) — that
+    one isn't a duplicate of labels, it's a duplicate of compile work.
+    """
+    primary = _resolve_primary_nodes(ctx)
+    extra = _resolve_always_check_nodes(ctx)
+    if primary == None and extra == None:
         return []
+    if primary == None:
+        merged = extra
+    elif extra == None:
+        merged = primary
+    else:
+        merged = primary + extra
+    return _drop_libs_shadowed_by_unittest(merged)
 
-    analysis = ctx.analysis(nodes).values()
+def _run(ctx: bxl.Context) -> None:
+    # Emit the project_root header first so the consumer can parse it before
+    # any per-target diagnostic record arrives. No `wait_on` -> streams
+    # immediately during evaluation.
+    #
+    # `pretty = False` is load-bearing: the consumer reads stdout line by line
+    # and `stream_json` defaults to pretty-printing (multi-line) JSON.
+    ctx.output.stream_json({"project_root": ctx.root()}, pretty = False)
 
-    artifacts = []
-    for a in analysis:
+    nodes = _resolve_nodes(ctx)
+    if len(nodes) == 0:
+        return
+
+    analysis_by_label = ctx.analysis(nodes)
+
+    for label, a in analysis_by_label.items():
         o = a.providers()[RustcExtraOutputsInfo]
         # Temporarily disabled due to ICE reports in https://fb.workplace.com/groups/rust.analyzer/posts/1512577186779084
         # and https://github.com/rust-lang/rust/issues/141540
         # if ctx.cli_args.use_clippy:
-        #     artifacts.append(o.clippy_incr.diag_json)
+        #     artifact = o.clippy_incr.diag_json
         # else:
-        #     artifacts.append(o.metadata_incr.diag_json)
-
+        #     artifact = o.metadata_incr.diag_json
         if ctx.cli_args.use_clippy:
-            artifacts.append(o.clippy.diag_json)
+            artifact = o.clippy.diag_json
         else:
-            artifacts.append(o.metadata.diag_json)
+            artifact = o.metadata.diag_json
 
-    art_output = ctx.output.ensure_multiple(artifacts)
-
-    return [
-        artifact.abs_path()
-        for artifact in art_output
-    ]
-
-def _run(ctx: bxl.Context) -> None:
-    diagnostic_paths = _check_targets_impl(ctx)
-
-    out = {
-        "diagnostic_paths": diagnostic_paths,
-        "project_root": ctx.root(),
-    }
-
-    ctx.output.print_json(out)
+        ensured = ctx.output.ensure(artifact)
+        ctx.output.stream_json(
+            {
+                "diagnostic_path": ensured.abs_path(),
+                "target": str(label.raw_target()),
+            },
+            pretty = False,
+            wait_on = [ensured],
+        )
 
 check = bxl_main(
     impl = _run,
     cli_args = {
+        # User-configured allow-list of target patterns that should be checked
+        # alongside the saved-file's owning target(s). Pass once per pattern:
+        # `--always-check //foo/... --always-check //bar:lib`.
+        "always-check": cli_args.option(cli_args.list(cli_args.target_expr())),
         "file": cli_args.option(cli_args.string()),
+        # How widely to expand the saved-file's owning target(s). See
+        # `_SIBLING_LEVELS` for the supported values and what each pulls in.
+        "include-siblings": cli_args.enum(_SIBLING_LEVELS, default = "unittest"),
         "target": cli_args.option(cli_args.target_label()),
         "use-clippy": cli_args.bool(),
     },
